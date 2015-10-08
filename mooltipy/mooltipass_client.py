@@ -24,6 +24,11 @@ from .mooltipass import _Mooltipass
 # Delete me after removing read_all_nodes
 from collections import defaultdict
 
+PARENT_NODE = 0x0000
+CHILD_NODE = 0x4000
+DATA_NODE = 0x8000
+
+
 class MooltipassClient(_Mooltipass):
     """Inherits _Mooltipass() and extends raw USB/firmware calls.
 
@@ -162,82 +167,117 @@ class MooltipassClient(_Mooltipass):
                     'a data transfer was cancelled.')
         return data[4:lod+4]
 
-    def read_node(self, node_number):
-        """Extend mooltipass to unpack return and create object."""
-        recv = super(MooltipassClient, self).read_node(node_number)
+    def read_node(self, node_addr):
+        """Extend Mooltipass class to return a Node object."""
+        recv = super(MooltipassClient, self).read_node(node_addr)
         # Use flags to figure out the node type
         flags = struct.unpack('<H', recv[:2])[0]
-        if flags & 0xC000 == 0x00:
+        if flags & 0xC000 == PARENT_NODE:
             # This is a parent node
-            prev_parent_addr, next_parent_addr, next_child_addr = \
-                struct.unpack('<HHH', recv[2:8])
-            recv = recv[8:66]
-            service_name = struct.unpack('<{}s'.format(
-                    len(recv)), recv)[0].strip('\0')
-            return ParentNode(
-                    node_number,
-                    flags,
-                    prev_parent_addr,
-                    next_parent_addr,
-                    next_child_addr,
-                    service_name,
-                    self)
-
-        elif flags & 0xC000 == 0x4000:
+            return ParentNode(node_addr, recv, weakref.ref(self)())
+        elif flags & 0xC000 == CHILD_NODE:
             # This is a credential child node
-            prev_child_addr, next_child_addr, \
-            descr, date_created, date_last_used, \
-            ctr1, ctr2, ctr3, login, password = \
-                    struct.unpack("<HH24sHH3b63s32s", recv[2:132])
-            ctr = (ctr1 << 16) + (ctr2 << 8) + ctr3
-            return ChildNode(node_number,
-                    flags,
-                    prev_child_addr,
-                    next_child_addr,
-                    descr[0],
-                    date_created,
-                    date_last_used,
-                    ctr,
-                    login,
-                    password,
-                    self)
-        elif flags & 0xC000 == 0x8000:
-            # This is the start of a data sequence
-            print("Data nodes are not yet supported!")
+            return ChildNode(node_addr, recv, weakref.ref(self)())
+        elif flags & 0xC000 == DATA_NODE:
+            return ParentNode(node_addr, recv, weakref.ref(self)())
         else:
-            print("Unknown node type received!")
+            return DataNode(node_addr, recv, weakref.ref(self)())
 
-    def parent_nodes(self):
+    def parent_nodes(self, node_type=None):
         """Return a ParentNodes iter."""
         # TODO: Comment and make a property too?
-        return _ParentNodes(self)
+        return _ParentNodes(node_type, self)
 
 
-class ParentNode(object):
-    """Represent a parent node."""
+class Node(object):
+    """Parent/Child/Data nodes have some similar, overlapping structure.
 
-    service_name = str()
+    The Node class is intended to be inherited by Parent/Child/DataNode classes.
+    """
+    # Node should accept a raw array of data from read_node(). Access to
+    # each element contained within a node should be controlled through
+    # properties. This is not a typical design in Python, but in our case
+    # manipulation of nodes should be minimal (so performance is not a
+    # concern), separate properties will help clearly delineate values
+    # from the contiguous array of data provided by read_node(), and
+    # properties will be necessary for bound checking to aide in adhering
+    # to the constraints of the Mooltipass's node structure.
 
-    def __init__(
-            self,
-            node_addr,
-            flags,
-            prev_parent_addr,
-            next_parent_addr,
-            next_child_addr,
-            service_name,
-            parent = None):
+    addr = None
+    raw = None
 
-        self.node_addr = node_addr
-        self.prev_parent_addr = prev_parent_addr
-        self.next_parent_addr = next_parent_addr
-        self.next_child_addr = next_child_addr
-        for c in service_name:
-            if c == '\00':
-                break
-            self.service_name += c
-        self._parent_ref = weakref.ref(parent)
-        self._parent = self._parent_ref()
+    @property
+    def flags(self):
+        return struct.unpack('<H', self.raw[:2])[0]
+
+    @flags.setter
+    def flags(self, value):
+        pass
+
+    @property
+    def first_addr(self):
+        # The 2 bytes after flags is always an address but its use
+        # differs by node type:
+        #  * ParentNode.prev_parent_addr
+        #  * ChildNode.next_child_addr
+        #  * DataNode.next_addr
+        return struct.unpack('<H', self.raw[2:4])[0]
+
+    @first_addr.setter
+    def first_addr(self, value):
+        pass
+
+    def __init__(self, node_addr, recv, parent_weak_ref = None):
+        self.addr = node_addr
+        self.raw = recv
+        self._parent = parent_weak_ref
+
+
+class ParentNode(Node):
+    """Represent a parent node.
+
+    Inherits Node.
+    """
+
+    @property
+    def flags(self):
+        return super(ParentNode, self).flags
+
+    @flags.setter
+    def flags(self, value):
+        super(ParentNode, self).flags
+
+    @property
+    def prev_parent_addr(self):
+        return super(ParentNode, self).first_addr
+
+    @prev_parent_addr.setter
+    def prev_parent_addr(self, value):
+        super(ParentNode, self).first_addr
+
+    @property
+    def next_parent_addr(self):
+        return struct.unpack('<H', self.raw[4:6])[0]
+
+    @next_parent_addr.setter
+    def next_parent_addr(self, value):
+        pass
+
+    @property
+    def next_child_addr(self):
+        return struct.unpack('<H', self.raw[6:8])[0]
+
+    @next_child_addr.setter
+    def next_child_addr(self, value):
+        pass
+
+    @property
+    def service_name(self):
+        return struct.unpack('<58s', self.raw[8:66])[0].strip('\0')
+
+    @service_name.setter
+    def service_name(self, value):
+        pass
 
     def __str__(self):
         return "<{}: Address:0x{:x}, PrevParent:0x{:x}, NextParent:0x{:x}, NextChild:0x{:x}, ServiceName:{}>".format(self.__class__.__name__, self.node_addr, self.prev_parent_addr, self.next_parent_addr, self.next_child_addr, self.service_name)
@@ -250,33 +290,69 @@ class ParentNode(object):
         return _ChildNodes(self)
 
 
-class ChildNode(object):
-    """Represent a child node."""
-    def __init__(
-            self,
-            node_addr,
-            flags,
-            prev_child_addr,
-            next_child_addr,
-            description,
-            date_created,
-            date_last_used,
-            ctr,
-            login,
-            password,
-            parent):
-        self.node_addr = node_addr
-        self.flags = flags
-        self.prev_child_addr = prev_child_addr
-        self.next_child_addr = next_child_addr
-        self.description = description
-        self.date_created = date_created
-        self.date_last_used = date_last_used
-        self.ctr = ctr
-        self.login = login
-        self.password = password
-        self._parent_ref = weakref.ref(parent)
-        self._parent = self._parent_ref()
+class ChildNode(Node):
+    """Represent a child node.
+
+    Inherits Node.
+    """
+
+    @property
+    def flags(self):
+        return super(ChildNode, self).flags
+
+    @flags.setter
+    def flags(self, value):
+        super(ChildNode, self).flags
+
+    @property
+    def prev_child_addr(self):
+        return super(ChildNode, self).first_addr
+
+    @prev_child_addr.setter
+    def prev_child_addr(self, value):
+        super(ChildNode, self).first_addr
+
+    @property
+    def next_child_addr(self):
+        return struct.unpack('<H', self.raw[4:6])[0]
+
+    @next_child_addr.setter
+    def next_child_addr(self, value):
+        pass
+
+    @property
+    def description(self):
+        return struct.unpack('<24s', self.raw[6:30])[0].strip('\0')
+
+    @description.setter
+    def description(self, value):
+        pass
+
+    @property
+    def date_created(self):
+        return struct.unpack('<H', self.raw[30:32])[0]
+
+    @property
+    def date_last_used(self):
+        return struct.unpack('<H', self.raw[32:34])[0]
+
+    @property
+    def ctr(self):
+        c1, c2, c3 = struct.unpack('<3b', self.raw[34:37])[0]
+        # I have no idea if this is correct
+        return (c1 << 16) + (c2 << 8) + c3
+
+    @property
+    def login(self):
+        return struct.unpack('<63s', self.raw[37:100])[0]
+
+    @login.setter
+    def login(self, value):
+        pass
+
+    @property
+    def password(self):
+        return struct.unpack('<32s', self.raw[100:132])[0]
 
     def __str__(self):
         return "<{}: Address:0x{:x} PrevChild:0x{:x} NextChild:0x{:x} Login:{}>".format(self.__class__.__name__, self.node_addr, self.prev_child_addr, self.next_child_addr, self.login)
@@ -285,20 +361,61 @@ class ChildNode(object):
         return str(self)
 
 
+class DataNode(Node):
+    """Represent a data node.
+
+    Inherits Node.
+    """
+
+    @property
+    def flags(self):
+        return super(DataNode, self).flags
+
+    @flags.setter
+    def flags(self, value):
+        super(DataNode, self).flags
+
+    @property
+    def next_data_addr(self):
+        return super(DataNode, self).first_addr
+
+    @next_data_addr.setter
+    def next_data_addr(self, value):
+        super(DataNode, self).first_addr
+
+    @property
+    def data(self):
+        return struct.unpack('<128s', self.raw[4:132])[0]
+
+
 class _ParentNodes(object):
     """Parent node iterator.
 
     Intended to be returned to the user by way of method from
     MooltipassClient: MooltipassClient.parent_nodes()
     """
-
+    node_type = None
     current_node = None
     next_parent_addr = None
 
-    def __init__(self, parent):
+    def __init__(self, node_type=None, parent=None):
+        """Instantiate a parent node iterator.
+
+        Arguments:
+            node_type = [login|data]
+            parent = Reference to parent object (i.e. Mooltipass)
+        """
+        # TODO: Allow None and iterate all nodes starting at 0; identify type
+        #   of node with self.node_type?
+        if not node_type in ['login','data']:
+            raise RuntimeError('node_type must be \'login\' or \'data\'')
+        self._node_type = node_type
         self._parent_ref = weakref.ref(parent)
         self._parent = self._parent_ref()
-        self.next_parent_addr = self._parent.get_starting_parent_address()
+        if node_type == 'login':
+            self.next_parent_addr = self._parent.get_starting_parent_address()
+        else:
+            self.next_parent_addr = self._parent.get_starting_data_parent_address()
 
     def __iter__(self):
         return self
@@ -317,19 +434,24 @@ class _ParentNodes(object):
 
 
 class _ChildNodes(object):
-    """Child node iterator.
+    """Child [or Data] node iterator.
 
     Intended to be returned to the user by way of method from
-    the ParentNode class: pnode.child_nodes().
+    the ParentNode class: MooltipassClient.ParentNode.child_nodes().
     """
+    # All storage nodes start with a parent. Some parents point to child nodes
+    # and store credentials; some parents point to data nodes to store data.
+    # Rather than a separate iter for child and data nodes, just this one
+    # is fine. The only problem is a slight inconsistency in the property
+    # containing the address of the next node in series explained below.
 
     current_node = None
-    next_child_addr = None
+    next_addr = None
 
     def __init__(self, parent):
         self._parent_ref = weakref.ref(parent)
         self._parent = self._parent_ref()
-        self.next_child_addr = self._parent.next_child_addr
+        self.next_addr = self._parent.next_child_addr
 
     def __iter__(self):
         return self
@@ -339,9 +461,19 @@ class _ChildNodes(object):
         return self.__next__()
 
     def __next__(self):
-        if self.next_child_addr == 0:
+        if self.next_addr == 0:
             raise StopIteration()
 
-        self.current_node = self._parent._parent.read_node(self.next_child_addr)
-        self.next_child_addr = self.current_node.next_child_addr
+        # The Mooltipass node structure goes Mooltipass.ParentNode.ChildNode
+        # and ._parent points up one level up therefore:
+        # self._parent._parent.read_node() == \
+        #       _ChildNodes.ParentNode.Mooltipass.read_node()
+        self.current_node = self._parent._parent.read_node(self.next_addr)
+
+        # Child nodes store the next address in .next_child_addr while data
+        # nodes use .next_data_addr
+        if self._parent.flags & 0xC000 == PARENT_NODE:
+            self.next_addr = self.current_node.next_child_addr
+        elif self._parent.flags & 0xC000 == DATA_NODE:
+            self.next_addr = self.current_node.next_data_addr
         return self.current_node
