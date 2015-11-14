@@ -167,21 +167,35 @@ class MooltipassClient(_Mooltipass):
                     'a data transfer was cancelled.')
         return data[4:lod+4]
 
-    def read_node(self, node_addr):
-        """Extend Mooltipass class to return a Node object."""
+    def read_node(self, node_addr, parent_weak_ref=None):
+        """Extend Mooltipass class to return a Node object.
+
+        Arguments:
+            node_addr       -- Address of node to fetch.
+            parent_weak_ref -- Specifies the return object's parent.
+                This allow child nodes to refer to their parent's
+                functions & variables. Optional, and default assumes
+                the parent object is Mooltipassclient.
+        """
         recv = super(MooltipassClient, self).read_node(node_addr)
+        if parent_weak_ref == None:
+            parent_weak_ref = weakref.ref(self)()
         # Use flags to figure out the node type
         flags = struct.unpack('<H', recv[:2])[0]
         if flags & 0xC000 == PARENT_NODE:
             # This is a parent node
-            return ParentNode(node_addr, recv, weakref.ref(self)())
+            return ParentNode(node_addr, recv, parent_weak_ref)
         elif flags & 0xC000 == CHILD_NODE:
             # This is a credential child node
-            return ChildNode(node_addr, recv, weakref.ref(self)())
+            return ChildNode(node_addr, recv, parent_weak_ref)
         elif flags & 0xC000 == DATA_NODE:
-            return ParentNode(node_addr, recv, weakref.ref(self)())
+            return ParentNode(node_addr, recv, parent_weak_ref)
         else:
-            return DataNode(node_addr, recv, weakref.ref(self)())
+            return DataNode(node_addr, recv, parent_weak_ref)
+
+    def write_node(self, node):
+        """Write to a node in memory."""
+        return super(MooltipassClient, self)._write_node(node.addr, node.raw)
 
     def parent_nodes(self, node_type=None):
         """Return a ParentNodes iter."""
@@ -199,12 +213,13 @@ class Node(object):
     # properties. This is not a typical design in Python, but in our case
     # manipulation of nodes should be minimal (so performance is not a
     # concern), separate properties will help clearly delineate values
-    # from the contiguous array of data provided by read_node(), and
+    # from the contiguous array of bytes provided by read_node(), and
     # properties will be necessary for bound checking to aide in adhering
     # to the constraints of the Mooltipass's node structure.
 
     addr = None
     raw = None
+    _parent = None
 
     @property
     def flags(self):
@@ -225,7 +240,7 @@ class Node(object):
 
     @first_addr.setter
     def first_addr(self, value):
-        pass
+        self.raw[2:4] = array('B', struct.pack('<H', value))
 
     def __init__(self, node_addr, recv, parent_weak_ref = None):
         self.addr = node_addr
@@ -261,7 +276,7 @@ class ParentNode(Node):
 
     @next_parent_addr.setter
     def next_parent_addr(self, value):
-        pass
+        self.raw[4:6] = array('B', struct.pack('<H', value))
 
     @property
     def next_child_addr(self):
@@ -269,7 +284,7 @@ class ParentNode(Node):
 
     @next_child_addr.setter
     def next_child_addr(self, value):
-        pass
+        self.raw[6:8] = array('B', struct.pack('<H', value))
 
     @property
     def service_name(self):
@@ -284,6 +299,9 @@ class ParentNode(Node):
 
     def __repr__(self):
         return str(self)
+
+    def write(self):
+        return self._parent._write_node(self.addr, self.raw)
 
     def child_nodes(self):
         """Return a child node iter."""
@@ -310,7 +328,7 @@ class ChildNode(Node):
 
     @prev_child_addr.setter
     def prev_child_addr(self, value):
-        super(ChildNode, self).first_addr
+        super(ChildNode, ChildNode).first_addr.__set__(self, value)
 
     @property
     def next_child_addr(self):
@@ -318,7 +336,7 @@ class ChildNode(Node):
 
     @next_child_addr.setter
     def next_child_addr(self, value):
-        pass
+        self.raw[4:6] = array('B', struct.pack('<H', value))
 
     @property
     def description(self):
@@ -344,10 +362,14 @@ class ChildNode(Node):
 
     @property
     def login(self):
-        return struct.unpack('<63s', self.raw[37:100])[0]
+        return struct.unpack('<63s', self.raw[37:100])[0].strip('\0')
 
     @login.setter
     def login(self, value):
+        if len(value) > 62:
+            raise RuntimeError('Login can not exceed 62 characters.')
+        value += ('\x00' * (len(value) - 63))
+        self.raw[37:100] = array('B', struct.pack('<63s', value))
         pass
 
     @property
@@ -360,6 +382,31 @@ class ChildNode(Node):
     def __repr__(self):
         return str(self)
 
+    def write(self):
+        return self._parent._parent._write_node(self.addr, self.raw)
+
+    def delete(self):
+        """Delete a child node."""
+        if self.prev_child_addr == 0:
+            # If there is a previous_child_node under this parent, update it
+            # so it points to the next valid node
+            self._parent.next_child_addr = self.next_child_addr
+            self._parent.write()
+        else:
+            # If no prev_child_addr exists, update the parent node instead
+            prev_child_node = self._parent._parent.read_node(self.prev_child_addr, self._parent)
+            prev_child_node.next_child_addr = self.next_child_addr
+            prev_child_node.write()
+
+        # If there is a next_child_node, its prev_child_addr must be updated
+        if self.next_child_addr <> 0:
+            next_child_node = self._parent._parent.read_node(self.next_child_addr, self._parent)
+            next_child_node.prev_child_addr = self.prev_child_addr
+            next_child_node.write()
+
+        # Zero/fill the node so it is not considered an oprhan
+        self.raw = array('B', '\xff'*132)
+        self.write()
 
 class DataNode(Node):
     """Represent a data node.
@@ -468,7 +515,7 @@ class _ChildNodes(object):
         # and ._parent points up one level up therefore:
         # self._parent._parent.read_node() == \
         #       _ChildNodes.ParentNode.Mooltipass.read_node()
-        self.current_node = self._parent._parent.read_node(self.next_addr)
+        self.current_node = self._parent._parent.read_node(self.next_addr, self._parent)
 
         # Child nodes store the next address in .next_child_addr while data
         # nodes use .next_data_addr
